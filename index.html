@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>课堂同传</title>
+<style>
+/* Layout: 固定顶栏 + 滚动字幕区，中文大字为主，英文原文小字在上 */
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --fg:#1b1f27; --muted:#6b7385;
+  --line:#e3e6ec; --accent:#2f6fe4; --accent-fg:#fff; --live:#d93b3b; --hl:#eef3fd;
+  --zh:28px; --en:16px;
+  --f-zh:"PingFang SC","Hiragino Sans GB","Noto Sans SC",system-ui,sans-serif;
+  --f-en:-apple-system,"Helvetica Neue",system-ui,sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#12151b; --panel:#1a1e26; --fg:#e8ebf1; --muted:#8a93a6;
+  --line:#2a303b; --accent:#5b8ff0; --accent-fg:#0d1118; --live:#ff6b6b; --hl:#1c2533;
+  color-scheme:dark;
+}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:var(--f-en);display:flex;flex-direction:column}
+header{
+  position:sticky;top:0;z-index:2;background:var(--panel);border-bottom:1px solid var(--line);
+  padding:calc(10px + env(safe-area-inset-top,0px)) 16px 10px;
+  display:flex;flex-wrap:wrap;gap:10px;align-items:center
+}
+h1{font-size:17px;margin:0 auto 0 0;font-family:var(--f-zh);display:flex;align-items:center;gap:8px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted)}
+.on .dot{background:var(--live);animation:pulse 1.4s infinite}
+@keyframes pulse{50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.on .dot{animation:none}}
+button{
+  font:600 15px var(--f-zh);border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  border-radius:10px;padding:9px 14px;cursor:pointer;min-height:42px
+}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#toggle{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);min-width:110px}
+.on #toggle{background:var(--live);border-color:var(--live)}
+#status{font:13px var(--f-zh);color:var(--muted);padding:8px 16px 0;min-height:24px}
+main{flex:1;overflow-y:auto;padding:8px 16px 40vh;-webkit-overflow-scrolling:touch}
+.line{padding:14px 0;border-bottom:1px solid var(--line);max-width:900px;margin:0 auto}
+.en{font-size:var(--en);color:var(--muted);line-height:1.45}
+.zh{font:500 var(--zh)/1.45 var(--f-zh);margin-top:4px}
+.zh.wait{color:var(--muted)}
+.t{font:12px var(--f-en);color:var(--muted);font-variant-numeric:tabular-nums;margin-bottom:2px}
+#live{background:var(--hl);border-radius:12px;padding:12px 14px;border:0;margin-top:10px}
+#live .en{color:var(--fg);font-size:calc(var(--en) + 2px)}
+.empty{max-width:560px;margin:40px auto;font:16px/1.7 var(--f-zh);color:var(--muted)}
+.empty b{color:var(--fg)}
+</style>
+</head>
+<body>
+<header id="bar">
+  <h1><span class="dot"></span>课堂同传</h1>
+  <button id="smaller" aria-label="字体变小">A−</button>
+  <button id="bigger" aria-label="字体变大">A+</button>
+  <button id="copy">复制全部</button>
+  <button id="clear">清空</button>
+  <button id="toggle">开始</button>
+</header>
+<div id="status"></div>
+<main id="list">
+  <div class="empty" id="empty">
+    点右上角 <b>开始</b>，允许使用麦克风，把 iPad 放在离老师近一点的地方。<br>
+    老师说的英语会一句句显示出来，下面是中文翻译。<br>
+    笔记会自动保存在这台 iPad 上，下课后可以点 <b>复制全部</b> 粘贴到备忘录。
+  </div>
+  <div class="line" id="live" hidden><div class="en"></div></div>
+</main>
+<script>
+(() => {
+const $ = s => document.querySelector(s);
+const list = $('#list'), live = $('#live'), liveEn = live.querySelector('.en');
+const statusEl = $('#status'), bar = $('#bar'), emptyEl = $('#empty');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let lines = [];          // {t, en, zh}
+let running = false, rec = null, interim = '', pauseTimer = null, ignoreUntilEnd = false;
+let zhSize = 28;
+
+function save(){ try{ localStorage.setItem('ktct-lines', JSON.stringify(lines.slice(-800))); localStorage.setItem('ktct-size', zhSize);}catch(e){} }
+function load(){
+  try{ lines = JSON.parse(localStorage.getItem('ktct-lines')||'[]'); zhSize = +localStorage.getItem('ktct-size') || 28; }catch(e){ lines = []; }
+}
+function setSize(){ document.documentElement.style.setProperty('--zh', zhSize+'px'); document.documentElement.style.setProperty('--en', Math.round(zhSize*0.58)+'px'); }
+function status(msg){ statusEl.textContent = msg || ''; }
+function nearBottom(){ return list.scrollHeight - list.scrollTop - list.clientHeight < 260; }
+function scrollDown(force){ if(force || nearBottom()) requestAnimationFrame(()=>{ list.scrollTop = list.scrollHeight; }); }
+
+function renderLine(l){
+  const d = document.createElement('div'); d.className='line';
+  const t = document.createElement('div'); t.className='t'; t.textContent = l.t;
+  const en = document.createElement('div'); en.className='en'; en.textContent = l.en;
+  const zh = document.createElement('div'); zh.className = 'zh' + (l.zh ? '' : ' wait'); zh.textContent = l.zh || '翻译中…';
+  d.append(t,en,zh); list.insertBefore(d, live); l.el = zh;
+  emptyEl.hidden = true;
+}
+function now(){ const d=new Date(); return d.toTimeString().slice(0,5); }
+
+async function translate(text){
+  // 1) Google 免费接口  2) MyMemory 备用
+  try{
+    const u = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t&q=' + encodeURIComponent(text);
+    const r = await fetch(u); if(!r.ok) throw 0;
+    const j = await r.json(); const out = j[0].map(x=>x[0]).join('');
+    if(out) return out;
+  }catch(e){}
+  try{
+    const u = 'https://api.mymemory.translated.net/get?langpair=en|zh-CN&q=' + encodeURIComponent(text.slice(0,480));
+    const r = await fetch(u); const j = await r.json();
+    if(j.responseData && j.responseData.translatedText) return j.responseData.translatedText;
+  }catch(e){}
+  return null;
+}
+
+async function commit(text){
+  text = text.trim(); if(!text) return;
+  const near = nearBottom();
+  const l = { t: now(), en: text, zh: '' }; lines.push(l); renderLine(l); scrollDown(near);
+  const zh = await translate(text);
+  l.zh = zh || ''; l.el.textContent = zh || '（翻译失败，请检查网络）';
+  l.el.classList.toggle('wait', !zh); save(); scrollDown(near);
+}
+
+function showInterim(){
+  live.hidden = !interim; liveEn.textContent = interim; scrollDown();
+}
+
+function flushInterim(){
+  // Safari 经常迟迟不给“最终结果”，停顿后手动把这句提交并重启识别
+  clearTimeout(pauseTimer);
+  if(!interim) return;
+  const text = interim; interim = ''; showInterim();
+  commit(text);
+  ignoreUntilEnd = true;
+  try{ rec && rec.stop(); }catch(e){}
+}
+
+function makeRec(){
+  const r = new SR();
+  r.lang = 'en-US'; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
+  r.onresult = ev => {
+    if(ignoreUntilEnd) return;
+    let fin = '', inter = '';
+    for(let i = ev.resultIndex; i < ev.results.length; i++){
+      const res = ev.results[i];
+      if(res.isFinal) fin += res[0].transcript + ' '; else inter += res[0].transcript;
+    }
+    if(fin.trim()){ interim = ''; showInterim(); clearTimeout(pauseTimer); commit(fin); }
+    if(inter){
+      interim = inter; showInterim();
+      clearTimeout(pauseTimer);
+      if(interim.length > 220) flushInterim();
+      else pauseTimer = setTimeout(flushInterim, 1300);
+    }
+  };
+  r.onerror = e => {
+    if(e.error === 'not-allowed' || e.error === 'service-not-allowed'){
+      stop(); status('没有麦克风权限：请在 设置 › Safari › 麦克风 里允许，然后刷新页面。');
+    } else if(e.error === 'network'){
+      status('语音识别需要联网，正在重试…');
+    }
+  };
+  r.onend = () => {
+    ignoreUntilEnd = false;
+    if(interim) { const t = interim; interim=''; showInterim(); commit(t); }
+    if(running) setTimeout(() => { try{ r.start(); }catch(e){} }, 150);
+  };
+  return r;
+}
+
+let wake = null;
+async function keepAwake(){ try{ wake = await navigator.wakeLock.request('screen'); }catch(e){} }
+
+function start(){
+  if(!SR){ status('这个浏览器不支持语音识别，请用 iPad 自带的 Safari 打开。'); return; }
+  running = true; bar.classList.add('on'); $('#toggle').textContent = '停止';
+  status('正在听…');
+  rec = rec || makeRec();
+  try{ rec.start(); }catch(e){}
+  keepAwake();
+}
+function stop(){
+  running = false; bar.classList.remove('on'); $('#toggle').textContent = '开始';
+  clearTimeout(pauseTimer);
+  try{ rec && rec.stop(); }catch(e){}
+  try{ wake && wake.release(); }catch(e){}
+  status('已暂停');
+}
+
+$('#toggle').onclick = () => running ? stop() : start();
+$('#bigger').onclick = () => { zhSize = Math.min(48, zhSize+3); setSize(); save(); };
+$('#smaller').onclick = () => { zhSize = Math.max(18, zhSize-3); setSize(); save(); };
+let clearArmed = false;
+$('#clear').onclick = e => {
+  if(!clearArmed){ clearArmed = true; e.target.textContent = '确认清空?'; setTimeout(()=>{clearArmed=false; e.target.textContent='清空';}, 3000); return; }
+  clearArmed = false; e.target.textContent = '清空';
+  lines = []; save(); list.querySelectorAll('.line:not(#live)').forEach(n=>n.remove()); emptyEl.hidden = false;
+};
+$('#copy').onclick = async e => {
+  const txt = lines.map(l => `[${l.t}] ${l.en}\n${l.zh}`).join('\n\n');
+  try{ await navigator.clipboard.writeText(txt); e.target.textContent='已复制'; }
+  catch(err){ e.target.textContent='复制失败'; }
+  setTimeout(()=>e.target.textContent='复制全部', 1500);
+};
+document.addEventListener('visibilitychange', () => { if(document.visibilityState==='visible' && running) keepAwake(); });
+
+load(); setSize(); lines.forEach(l => { renderLine(l); l.el.textContent = l.zh || '（未翻译）'; });
+scrollDown(true);
+if(!SR) status('提示：请用 iPad 的 Safari 打开这个网页。');
+})();
+</script>
+</body>
+</html>
